@@ -675,17 +675,17 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 
-const provider = new GoogleAuthProvider();
+/* =====================================================
+   APPS SCRIPT BACKEND
+   ใส่ URL /exec ที่ได้จาก Deploy > Web app
+===================================================== */
 
-// บังคับให้ Google แสดงหน้าเลือกบัญชีทุกครั้ง
-provider.setCustomParameters({
-  prompt: 'select_account'
-});
+const GAS_BACKEND_URL =
+  'https://script.google.com/macros/s/AKfycbwOVFjcYzL8ztLXw-X2530rwbMSJV_esIFtVtpyOgP24w7oPsEeRud19QatTu81mY4S/exec';
 
-
-// ไม่จำเป็นสำหรับระบบนี้ เพราะอ่านชีทผ่าน Code.gs ด้วย google.script.run
-// เปิดใช้เฉพาะกรณีต้องการเรียก Google Sheets API จาก Browser โดยตรง
-// provider.addScope('https://www.googleapis.com/auth/spreadsheets.readonly');
+// ตัวอย่าง:
+// const GAS_BACKEND_URL =
+//   'https://script.google.com/macros/s/AKfycbxxxxxxxxxxxxxxxx/exec';
 
 let isSigningIn = false;
 let cachedAccessToken = null;
@@ -764,67 +764,234 @@ function fmt(val){
   return val;
 }
 
-function loadScore(email){
+/* =====================================================
+   APPS SCRIPT BRIDGE
+   หน้า Index นี้อยู่ภายนอก Apps Script จึงใช้ google.script.run โดยตรงไม่ได้
+   เราโหลด Bridge.html จาก Apps Script ใน iframe แล้วสื่อสารด้วย postMessage
+===================================================== */
 
-switchView('mainContent');
+let gasBridgeReady = false;
+let gasBridgeElement = null;
+let gasBridgeReadyResolve = null;
 
-document.getElementById('scoreContent').innerHTML =
-`
-<div class="text-center py-5">
-<div class="spinner-border text-success"></div>
-</div>
-`;
+const gasBridgeReadyPromise = new Promise(resolve => {
+  gasBridgeReadyResolve = resolve;
+});
 
-google.script.run
-.withSuccessHandler(res => {
+const pendingGasRequests = new Map();
 
-  if(res.success){
+function ensureGasBridge(){
 
-  scores = res.allData;
-  window.subjectCode =
-  (res.subjectInfo || '')
-    .trim()
-    .substring(0, 6);
-  const user =
-    auth.currentUser;
+  if (gasBridgeElement) return gasBridgeElement;
 
-  document.getElementById(
-    'headerUser'
-  ).innerHTML = `
-    <img
-      src="${user?.photoURL || ''}"
-      alt="Profile"
-    >
+  if (
+    !GAS_BACKEND_URL ||
+    GAS_BACKEND_URL.includes('PASTE_YOUR_')
+  ) {
+    throw new Error(
+      'กรุณาใส่ Apps Script Web App URL ที่ตัวแปร GAS_BACKEND_URL ก่อนใช้งาน'
+    );
+  }
 
-    <div class="user-meta">
-      <div class="student-id">
-        ${res.studentName || '-'}
-      </div>
+  gasBridgeElement = document.createElement('iframe');
+  gasBridgeElement.id = 'gasBridge';
+  gasBridgeElement.src =
+    GAS_BACKEND_URL +
+    (GAS_BACKEND_URL.includes('?') ? '&' : '?') +
+    'bridge=1';
 
-      <div class="student-id">
-        ${res.studentId || '-'}
-      </div>
+  gasBridgeElement.style.display = 'none';
+  gasBridgeElement.setAttribute('aria-hidden', 'true');
 
-      <div class="student-id">
-      ${res.subjectInfo || '-'}
-    </div>
+  document.body.appendChild(gasBridgeElement);
 
+  return gasBridgeElement;
+}
+
+window.addEventListener('message', event => {
+
+  // รับข้อมูลเฉพาะจาก iframe Bridge ที่เราสร้างเท่านั้น
+  if (
+    !gasBridgeElement ||
+    event.source !== gasBridgeElement.contentWindow
+  ) {
+    return;
+  }
+
+  const msg = event.data;
+
+  if (!msg || typeof msg !== 'object') return;
+
+  if (msg.type === 'GAS_BRIDGE_READY') {
+
+    if (!gasBridgeReady) {
+      gasBridgeReady = true;
+      gasBridgeReadyResolve();
+      console.log('Apps Script Bridge ready');
+    }
+
+    return;
+  }
+
+  if (msg.type !== 'GET_SCORE_RESULT') return;
+
+  const pending = pendingGasRequests.get(msg.requestId);
+
+  if (!pending) return;
+
+  pendingGasRequests.delete(msg.requestId);
+  clearTimeout(pending.timeoutId);
+
+  if (msg.ok === false) {
+    pending.reject(
+      new Error(msg.error || 'Apps Script Server error')
+    );
+    return;
+  }
+
+  pending.resolve(msg.result);
+});
+
+async function waitForGasBridge(timeoutMs = 15000){
+
+  ensureGasBridge();
+
+  if (gasBridgeReady) return;
+
+  let timeoutId;
+
+  try {
+    await Promise.race([
+      gasBridgeReadyPromise,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(
+            new Error('ไม่สามารถเชื่อมต่อ Apps Script Backend ได้')
+          ),
+          timeoutMs
+        );
+      })
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function requestScoreFromGas(){
+
+  const user = auth.currentUser;
+
+  if (!user) {
+    throw new Error('กรุณาเข้าสู่ระบบก่อนโหลดข้อมูลคะแนน');
+  }
+
+  await waitForGasBridge();
+
+  // ใช้ Firebase ID Token เป็นหลักฐานตัวตน
+  // Code.gs จะตรวจ Token และอ่าน Email จาก Firebase เอง
+  const idToken = await user.getIdToken(true);
+
+  const requestId =
+    'score_' +
+    Date.now() +
+    '_' +
+    Math.random().toString(36).slice(2);
+
+  return new Promise((resolve, reject) => {
+
+    const timeoutId = setTimeout(() => {
+
+      if (!pendingGasRequests.has(requestId)) return;
+
+      pendingGasRequests.delete(requestId);
+      reject(new Error('โหลดข้อมูลคะแนนเกินเวลาที่กำหนด'));
+
+    }, 20000);
+
+    pendingGasRequests.set(requestId, {
+      resolve,
+      reject,
+      timeoutId
+    });
+
+    gasBridgeElement.contentWindow.postMessage(
+      {
+        type: 'GET_SCORE',
+        requestId,
+        idToken
+      },
+      '*'
+    );
+  });
+}
+
+async function loadScore(){
+
+  switchView('mainContent');
+
+  document.getElementById('scoreContent').innerHTML = `
+    <div class="text-center py-5">
+      <div class="spinner-border text-success"></div>
     </div>
   `;
 
-  renderScores();
+  try {
 
-}else{
+    const res = await requestScoreFromGas();
 
-    showLoginError(res.msg);
+    if (!res || !res.success) {
 
-    logout().catch(err => console.error('Sign out error:', err));
+      switchView('loginView');
+      showLoginError(
+        res?.msg || 'ไม่สามารถโหลดข้อมูลคะแนนได้'
+      );
 
-}
+      await logout();
+      return;
+    }
 
-})
-.getScoreData(email);
+    scores = res.allData || {};
 
+    window.subjectCode =
+      (res.subjectInfo || '')
+        .trim()
+        .substring(0, 6);
+
+    const user = auth.currentUser;
+
+    document.getElementById('headerUser').innerHTML = `
+      <img
+        src="${user?.photoURL || ''}"
+        alt="Profile"
+      >
+
+      <div class="user-meta">
+        <div class="student-id">
+          ${res.studentName || '-'}
+        </div>
+
+        <div class="student-id">
+          ${res.studentId || '-'}
+        </div>
+
+        <div class="student-id">
+          ${res.subjectInfo || '-'}
+        </div>
+      </div>
+    `;
+
+    renderScores();
+
+  } catch (error) {
+
+    console.error('Load score error:', error);
+
+    switchView('loginView');
+    showLoginError(
+      error?.message ||
+      'ไม่สามารถเชื่อมต่อระบบคะแนนได้ กรุณาลองใหม่'
+    );
+  }
 }
 
 async function handleLogout(){
@@ -857,7 +1024,7 @@ function refreshCurrentPage(){
 
   if(user){
 
-    loadScore(user.email);
+    loadScore();
 
   }
 
@@ -1219,13 +1386,24 @@ const googleSignIn = async () => {
 
     isSigningIn = true;
 
+    // สร้าง Provider ใหม่ทุกครั้งที่กด Login
+    // เพื่อส่ง prompt=select_account ทุกครั้ง
+    const provider = new GoogleAuthProvider();
+
+    provider.setCustomParameters({
+      prompt: 'select_account',
+      hd: 'g.swu.ac.th'
+    });
+
     const result = await signInWithPopup(auth, provider);
 
     console.log('Signed in as:', result.user.email);
 
-    const credential = GoogleAuthProvider.credentialFromResult(result);
+    const credential =
+      GoogleAuthProvider.credentialFromResult(result);
 
-    // Access token ใช้เฉพาะกรณีเรียก Google API จาก Browser โดยตรง
+    // Google OAuth access token ไม่ใช้ในการอ่านคะแนน
+    // แต่เก็บไว้หากต้องใช้ Google API ในอนาคต
     cachedAccessToken = credential?.accessToken || null;
 
     return {
@@ -1320,6 +1498,9 @@ async function initializeAuth(){
 
   try {
 
+    // เริ่มโหลด Apps Script Bridge ตั้งแต่เปิดหน้า
+    ensureGasBridge();
+
     // เทียบเท่า firebase.auth.Auth.Persistence.NONE
     // สถานะ Login จะอยู่เฉพาะในหน่วยความจำและหายเมื่อ Refresh
     await setPersistence(auth, inMemoryPersistence);
@@ -1335,7 +1516,7 @@ async function initializeAuth(){
       (user) => {
 
         document.getElementById('loginView').style.display = 'none';
-        loadScore(user.email);
+        loadScore();
 
       },
       () => {
