@@ -762,24 +762,101 @@ function fmt(val){
 }
 
 /* =====================================================
-   APPS SCRIPT BRIDGE
-   หน้า Index นี้อยู่ภายนอก Apps Script จึงใช้ google.script.run โดยตรงไม่ได้
-   เราโหลด Bridge.html จาก Apps Script ใน iframe แล้วสื่อสารด้วย postMessage
+   APPS SCRIPT BACKEND BRIDGE
+   ใช้ URL Fragment (#) ส่ง Firebase ID Token ไปยัง Bridge.html
+   แล้วรับผลกลับด้วย window.postMessage จาก Apps Script
 ===================================================== */
-
-let gasBridgeReady = false;
-let gasBridgeElement = null;
-let gasBridgeReadyResolve = null;
-
-const gasBridgeReadyPromise = new Promise(resolve => {
-  gasBridgeReadyResolve = resolve;
-});
 
 const pendingGasRequests = new Map();
 
-function ensureGasBridge(){
+function isTrustedAppsScriptOrigin(origin){
 
-  if (gasBridgeElement) return gasBridgeElement;
+  try {
+
+    const url = new URL(origin);
+
+    if (url.protocol !== 'https:') {
+      return false;
+    }
+
+    return (
+      url.hostname === 'script.google.com' ||
+      url.hostname === 'script.googleusercontent.com' ||
+      url.hostname.endsWith('.googleusercontent.com')
+    );
+
+  } catch (_) {
+
+    return false;
+  }
+}
+
+window.addEventListener('message', event => {
+
+  // รับเฉพาะข้อความที่มาจาก Apps Script / googleusercontent
+  if (!isTrustedAppsScriptOrigin(event.origin)) {
+    return;
+  }
+
+  const msg = event.data;
+
+  if (!msg || typeof msg !== 'object') {
+    return;
+  }
+
+  if (
+    msg.type !== 'GET_SCORE_RESULT' &&
+    msg.type !== 'GAS_BRIDGE_ERROR'
+  ) {
+    return;
+  }
+
+  const requestId = String(msg.requestId || '');
+
+  if (!requestId) {
+    return;
+  }
+
+  const pending = pendingGasRequests.get(requestId);
+
+  if (!pending) {
+    console.warn('Unknown Apps Script request:', requestId);
+    return;
+  }
+
+  pendingGasRequests.delete(requestId);
+  clearTimeout(pending.timeoutId);
+
+  // iframe ใช้เพียงครั้งเดียวต่อ request แล้วลบทิ้ง
+  try {
+    pending.iframe?.remove();
+  } catch (_) {}
+
+  if (
+    msg.type === 'GAS_BRIDGE_ERROR' ||
+    msg.ok === false
+  ) {
+
+    pending.reject(
+      new Error(
+        msg.error ||
+        'Apps Script Backend error'
+      )
+    );
+
+    return;
+  }
+
+  pending.resolve(msg.result);
+});
+
+async function requestScoreFromGas(){
+
+  const user = auth.currentUser;
+
+  if (!user) {
+    throw new Error('กรุณาเข้าสู่ระบบก่อนโหลดข้อมูลคะแนน');
+  }
 
   if (
     !GAS_BACKEND_URL ||
@@ -790,107 +867,7 @@ function ensureGasBridge(){
     );
   }
 
-  gasBridgeElement = document.createElement('iframe');
-  gasBridgeElement.id = 'gasBridge';
-  gasBridgeElement.src =
-    GAS_BACKEND_URL +
-    (GAS_BACKEND_URL.includes('?') ? '&' : '?') +
-    'bridge=1';
-
-  gasBridgeElement.style.display = 'none';
-  gasBridgeElement.setAttribute('aria-hidden', 'true');
-
-  document.body.appendChild(gasBridgeElement);
-
-  return gasBridgeElement;
-}
-
-window.addEventListener('message', event => {
-
-  // รับข้อมูลเฉพาะจาก iframe Bridge ที่เราสร้างเท่านั้น
-  if (
-    !gasBridgeElement ||
-    event.source !== gasBridgeElement.contentWindow
-  ) {
-    return;
-  }
-
-  const msg = event.data;
-
-  if (!msg || typeof msg !== 'object') return;
-
-  if (msg.type === 'GAS_BRIDGE_READY') {
-
-    if (!gasBridgeReady) {
-      gasBridgeReady = true;
-      gasBridgeReadyResolve();
-      console.log('Apps Script Bridge ready:', msg.server || 'OK');
-    }
-
-    return;
-  }
-
-  if (msg.type === 'GAS_BRIDGE_ERROR') {
-    console.error('Apps Script Bridge error:', msg.error);
-    return;
-  }
-
-  if (msg.type !== 'GET_SCORE_RESULT') return;
-
-  const pending = pendingGasRequests.get(msg.requestId);
-
-  if (!pending) return;
-
-  pendingGasRequests.delete(msg.requestId);
-  clearTimeout(pending.timeoutId);
-
-  if (msg.ok === false) {
-    pending.reject(
-      new Error(msg.error || 'Apps Script Server error')
-    );
-    return;
-  }
-
-  pending.resolve(msg.result);
-});
-
-async function waitForGasBridge(timeoutMs = 15000){
-
-  ensureGasBridge();
-
-  if (gasBridgeReady) return;
-
-  let timeoutId;
-
-  try {
-    await Promise.race([
-      gasBridgeReadyPromise,
-      new Promise((_, reject) => {
-        timeoutId = setTimeout(
-          () => reject(
-            new Error('ไม่สามารถเชื่อมต่อ Apps Script Backend ได้')
-          ),
-          timeoutMs
-        );
-      })
-    ]);
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function requestScoreFromGas(){
-
-  const user = auth.currentUser;
-
-  if (!user) {
-    throw new Error('กรุณาเข้าสู่ระบบก่อนโหลดข้อมูลคะแนน');
-  }
-
-  await waitForGasBridge();
-
-  // ใช้ Firebase ID Token เป็นหลักฐานตัวตน
-  // Code.gs จะตรวจ Token และอ่าน Email จาก Firebase เอง
+  // Firebase ID Token ใช้ยืนยันตัวผู้ใช้ที่ Code.gs
   const idToken = await user.getIdToken(true);
 
   const requestId =
@@ -901,29 +878,75 @@ async function requestScoreFromGas(){
 
   return new Promise((resolve, reject) => {
 
+    const iframe = document.createElement('iframe');
+
+    iframe.id = 'gasBridge_' + requestId;
+    iframe.style.display = 'none';
+    iframe.setAttribute('aria-hidden', 'true');
+
+    // ส่ง requestId และ Firebase ID Token ผ่าน URL fragment
+    // Fragment จะไม่ถูกส่งเข้า doGet() โดยตรง แต่ Bridge.html อ่านได้
+    // ผ่าน google.script.url.getLocation()
+    const fragment = new URLSearchParams({
+      requestId,
+      idToken
+    }).toString();
+
+    iframe.src =
+      GAS_BACKEND_URL +
+      '#' +
+      fragment;
+
     const timeoutId = setTimeout(() => {
 
-      if (!pendingGasRequests.has(requestId)) return;
+      if (!pendingGasRequests.has(requestId)) {
+        return;
+      }
 
       pendingGasRequests.delete(requestId);
-      reject(new Error('โหลดข้อมูลคะแนนเกินเวลาที่กำหนด'));
 
-    }, 20000);
+      try {
+        iframe.remove();
+      } catch (_) {}
+
+      reject(
+        new Error(
+          'Apps Script Backend ไม่ตอบกลับภายในเวลาที่กำหนด'
+        )
+      );
+
+    }, 30000);
 
     pendingGasRequests.set(requestId, {
       resolve,
       reject,
-      timeoutId
+      timeoutId,
+      iframe
     });
 
-    gasBridgeElement.contentWindow.postMessage(
-      {
-        type: 'GET_SCORE',
-        requestId,
-        idToken
-      },
-      '*'
-    );
+    iframe.addEventListener('error', () => {
+
+      if (!pendingGasRequests.has(requestId)) {
+        return;
+      }
+
+      pendingGasRequests.delete(requestId);
+      clearTimeout(timeoutId);
+
+      try {
+        iframe.remove();
+      } catch (_) {}
+
+      reject(
+        new Error(
+          'ไม่สามารถโหลด Apps Script Backend ได้'
+        )
+      );
+    }, { once: true });
+
+    console.log('Request score from Apps Script:', requestId);
+
+    document.body.appendChild(iframe);
   });
 }
 
@@ -1501,9 +1524,6 @@ async function loginGoogle(){
 async function initializeAuth(){
 
   try {
-
-    // เริ่มโหลด Apps Script Bridge ตั้งแต่เปิดหน้า
-    ensureGasBridge();
 
     // เทียบเท่า firebase.auth.Auth.Persistence.NONE
     // สถานะ Login จะอยู่เฉพาะในหน่วยความจำและหายเมื่อ Refresh
