@@ -655,11 +655,13 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/fireba
 import {
   getAuth,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
   onAuthStateChanged,
   signOut,
   setPersistence,
-  inMemoryPersistence
+  browserSessionPersistence
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 
 const firebaseConfig = {
@@ -679,8 +681,29 @@ const provider = new GoogleAuthProvider();
 
 // บังคับให้ Google แสดงหน้าเลือกบัญชีทุกครั้ง
 provider.setCustomParameters({
-  prompt: 'select_account'
+  prompt: 'select_account',
+  hd: 'g.swu.ac.th'
 });
+
+// Firebase แนะนำ redirect flow สำหรับอุปกรณ์มือถือ
+function isMobileBrowser() {
+  const ua = navigator.userAgent || navigator.vendor || window.opera || '';
+
+  const isIOS =
+    /iPad|iPhone|iPod/i.test(ua) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  const isAndroid = /Android/i.test(ua);
+
+  return isIOS || isAndroid;
+}
+
+// Redirect จะปลอดภัยเมื่อหน้าเว็บกับ Firebase auth helper อยู่ origin เดียวกัน
+// ถ้าใช้ custom domain ให้ตั้ง firebaseConfig.authDomain เป็น domain เดียวกับเว็บ
+function canUseFirebaseRedirect() {
+  return location.hostname.toLowerCase() ===
+    String(firebaseConfig.authDomain || '').toLowerCase();
+}
 
 // URL สำหรับเรียก API ของ Google Apps Script Web App
 const GAS_API_URL = "https://script.google.com/macros/s/AKfycbwOVFjcYzL8ztLXw-X2530rwbMSJV_esIFtVtpyOgP24w7oPsEeRud19QatTu81mY4S/exec"; 
@@ -773,27 +796,47 @@ async function loadScore(email){
 
   try {
     const user = auth.currentUser;
-    if (!user) throw new Error("No user logged in");
-    
-    // ดึง Token จาก Firebase Auth ส่งไปตรวจที่ Backend เพื่อความปลอดภัย
-    const idToken = await user.getIdToken();
+    if (!user) throw new Error('No user logged in');
 
-    // ทำการ fetch ยิง API ข้ามโดเมนไปที่ Google Apps Script
+    // ดึง Firebase ID Token แล้วส่งให้ Backend ตรวจสอบ
+    const idToken = await user.getIdToken(true);
+
     const response = await fetch(GAS_API_URL, {
       method: 'POST',
       headers: {
-        // ใช้ text/plain เพื่อป้องกันปัญหา CORS Preflight ของฝั่ง Browser
-        'Content-Type': 'text/plain;charset=utf-8' 
+        // ใช้ text/plain เพื่อหลีกเลี่ยง CORS preflight
+        'Content-Type': 'text/plain;charset=utf-8'
       },
-      body: JSON.stringify({ idToken: idToken })
+      body: JSON.stringify({ idToken }),
+      cache: 'no-store',
+      redirect: 'follow'
     });
 
-    const res = await response.json();
+    // อ่านเป็น text ก่อน เพื่อให้เห็น error จริงหาก server ส่ง HTML/400 กลับมา
+    const raw = await response.text();
+
+    console.log('GAS response status:', response.status);
+    console.log('GAS response body:', raw);
+
+    if (!response.ok) {
+      throw new Error(
+        `GAS HTTP ${response.status}: ${raw.substring(0, 300)}`
+      );
+    }
+
+    let res;
+
+    try {
+      res = JSON.parse(raw);
+    } catch (parseError) {
+      console.error('Invalid JSON from GAS:', raw);
+      throw new Error('Server returned invalid JSON');
+    }
 
     if(res.success){
       scores = res.allData;
       window.subjectCode = (res.subjectInfo || '').trim().substring(0, 6);
-      
+
       document.getElementById('headerUser').innerHTML = `
         <img src="${user?.photoURL || ''}" alt="Profile">
         <div class="user-meta">
@@ -802,16 +845,26 @@ async function loadScore(email){
           <div class="student-id">${res.subjectInfo || '-'}</div>
         </div>
       `;
+
       renderScores();
+
     } else {
-      showLoginError(res.msg);
-      logout().catch(err => console.error('Sign out error:', err));
+      showLoginError(res.msg || 'ไม่สามารถโหลดข้อมูลคะแนนได้');
+      await logout();
     }
-    
+
   } catch (err) {
-    console.error('Fetch error:', err);
-    showLoginError('เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
-    logout().catch(err => console.error('Sign out error:', err));
+    console.error('loadScore error:', err);
+
+    showLoginError(
+      `เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ: ${err.message || 'Unknown error'}`
+    );
+
+    try {
+      await logout();
+    } catch (logoutError) {
+      console.error('Sign out error:', logoutError);
+    }
   }
 }
 
@@ -1201,54 +1254,54 @@ const initAuth = (
 
 };
 
-const googleSignIn = async () => {
-
-  try {
-
-    isSigningIn = true;
-
-    const result = await signInWithPopup(auth, provider);
-
-    console.log('Signed in as:', result.user.email);
-
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-
-    // Access token ใช้เฉพาะกรณีเรียก Google API จาก Browser โดยตรง
-    cachedAccessToken = credential?.accessToken || null;
-
-    return {
-      user: result.user,
-      accessToken: cachedAccessToken
-    };
-
-  } catch (error) {
-
-    console.error('Sign in error:', error);
-    throw error;
-
-  } finally {
-
-    isSigningIn = false;
-
-  }
-
-};
-
 const getAccessToken = async () => cachedAccessToken;
 
 const logout = async () => {
-
   await signOut(auth);
   cachedAccessToken = null;
-
 };
 
 function showLoggedOutView(){
-
   document.getElementById('mainContent').style.display = 'none';
   document.getElementById('globalHeader').style.display = 'none';
   document.getElementById('loginView').style.display = 'flex';
+}
 
+function showFirebaseLoginError(err){
+  console.error(
+    'Firebase login error:',
+    err?.code,
+    err?.message,
+    err
+  );
+
+  if (err?.code === 'auth/popup-closed-by-user') {
+    showLoginError('หน้าต่างเข้าสู่ระบบถูกปิด กรุณาลองใหม่');
+
+  } else if (err?.code === 'auth/popup-blocked') {
+    showLoginError('เบราว์เซอร์บล็อก Pop-up กรุณาอนุญาต Pop-up แล้วลองใหม่');
+
+  } else if (err?.code === 'auth/cancelled-popup-request') {
+    showLoginError('มีคำขอเข้าสู่ระบบซ้ำ กรุณาลองใหม่');
+
+  } else if (err?.code === 'auth/network-request-failed') {
+    showLoginError('ไม่สามารถเชื่อมต่อเครือข่ายได้ กรุณาตรวจสอบอินเทอร์เน็ต');
+
+  } else if (err?.code === 'auth/unauthorized-domain') {
+    showLoginError(
+      `Domain นี้ยังไม่ได้รับอนุญาตใน Firebase Authentication (${location.hostname})`
+    );
+
+  } else if (err?.code === 'auth/web-storage-unsupported') {
+    showLoginError(
+      'เบราว์เซอร์บล็อกพื้นที่จัดเก็บข้อมูลที่จำเป็นสำหรับการเข้าสู่ระบบ กรุณาเปิดด้วย Chrome หรือ Safari โดยตรง'
+    );
+
+  } else {
+    showLoginError(
+      `เข้าสู่ระบบไม่สำเร็จ: ${err?.message || err?.code || 'Unknown error'}`
+    );
+  }
 }
 
 async function loginGoogle(){
@@ -1257,90 +1310,113 @@ async function loginGoogle(){
   if (isLoggingIn || isSigningIn) return;
 
   if (!authReady) {
-    showLoginError('ระบบเข้าสู่ระบบยังไม่พร้อม กรุณารอสักครู่แล้วลองใหม่');
+    showLoginError('ระบบเข้าสู่ระบบยังไม่พร้อม กรุณาลองใหม่อีกครั้ง');
     return;
   }
 
   isLoggingIn = true;
+  isSigningIn = true;
   hideLoginError();
 
   try {
 
-    const result = await googleSignIn();
-    const email = (result?.user?.email || '').trim().toLowerCase();
+    // มือถือ โดยเฉพาะ iOS: ใช้ redirect เมื่อ authDomain พร้อม
+    if (isMobileBrowser() && canUseFirebaseRedirect()) {
+      console.log('Firebase auth mode: redirect');
+      console.log('Current host:', location.hostname);
+      console.log('Firebase authDomain:', firebaseConfig.authDomain);
 
-    // ตรวจสอบอีกครั้งก่อนอนุญาตให้ใช้งาน
+      await signInWithRedirect(auth, provider);
+
+      // หลังบรรทัดนี้ browser จะออกไปหน้า Google และกลับมาใหม่
+      return;
+    }
+
+    // หาก host กับ authDomain คนละ domain ให้ใช้ popup เพื่อไม่ให้ redirect
+    // ชนข้อจำกัด third-party storage ของ Safari/Chrome รุ่นใหม่
+    if (isMobileBrowser()) {
+      console.warn(
+        'Mobile redirect disabled because current host != authDomain:',
+        location.hostname,
+        firebaseConfig.authDomain
+      );
+    }
+
+    console.log('Firebase auth mode: popup');
+
+    const result = await signInWithPopup(auth, provider);
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    cachedAccessToken = credential?.accessToken || null;
+
+    const email = (result.user?.email || '').trim().toLowerCase();
+
     if (!email.endsWith('@g.swu.ac.th')) {
-
       await logout();
       showLoginError('กรุณาเข้าสู่ระบบด้วยบัญชี @g.swu.ac.th เท่านั้น');
       return;
-
     }
 
   } catch (err) {
-
-    if (err.code === 'auth/popup-closed-by-user') {
-      showLoginError('หน้าต่างเข้าสู่ระบบถูกปิด กรุณาลองใหม่');
-
-    } else if (err.code === 'auth/popup-blocked') {
-      showLoginError('เบราว์เซอร์บล็อก Pop-up กรุณาอนุญาต Pop-up แล้วลองใหม่');
-
-    } else if (err.code === 'auth/cancelled-popup-request') {
-      showLoginError('มีคำขอเข้าสู่ระบบซ้ำ กรุณารอสักครู่แล้วลองใหม่');
-
-    } else if (err.code === 'auth/network-request-failed') {
-      showLoginError('ไม่สามารถเชื่อมต่อเครือข่ายได้ กรุณาตรวจสอบอินเทอร์เน็ต');
-
-    } else {
-      showLoginError(`เข้าสู่ระบบไม่สำเร็จ: ${err.message || err.code || 'Unknown error'}`);
-    }
+    showFirebaseLoginError(err);
 
   } finally {
-
     isLoggingIn = false;
-
+    isSigningIn = false;
   }
-
 }
 
 async function initializeAuth(){
 
   try {
 
-    // เทียบเท่า firebase.auth.Auth.Persistence.NONE
-    // สถานะ Login จะอยู่เฉพาะในหน่วยความจำและหายเมื่อ Refresh
-    await setPersistence(auth, inMemoryPersistence);
+    // ต้องใช้ SESSION persistence เพราะ mobile redirect มีการ reload หน้าเว็บ
+    // สถานะจะหายเมื่อปิด tab/window ไม่ได้ค้างถาวรเหมือน LOCAL persistence
+    await setPersistence(auth, browserSessionPersistence);
 
-    // ล้างสถานะ Login เดิมที่อาจเหลือจากเวอร์ชัน compat
-    if (auth.currentUser) {
-      await logout();
+    // รับผลจาก signInWithRedirect() เมื่อ Google redirect กลับมาหน้านี้
+    try {
+      const redirectResult = await getRedirectResult(auth);
+
+      if (redirectResult?.user) {
+        const credential = GoogleAuthProvider.credentialFromResult(redirectResult);
+        cachedAccessToken = credential?.accessToken || null;
+
+        const email = (redirectResult.user.email || '').trim().toLowerCase();
+
+        console.log('Redirect login success:', email);
+
+        if (!email.endsWith('@g.swu.ac.th')) {
+          await logout();
+          showLoginError('กรุณาเข้าสู่ระบบด้วยบัญชี @g.swu.ac.th เท่านั้น');
+        }
+      }
+
+    } catch (redirectError) {
+      showFirebaseLoginError(redirectError);
     }
 
+    // สำคัญ: ห้าม logout auth.currentUser ตรงนี้
+    // เพราะ user ที่เพิ่งกลับจาก redirect จะถูก Firebase restore ที่จุดนี้
     authReady = true;
 
     unsubscribeAuth = initAuth(
       (user) => {
-
         document.getElementById('loginView').style.display = 'none';
         loadScore(user.email);
-
       },
       () => {
-
         showLoggedOutView();
-
       }
     );
 
   } catch (err) {
-
     authReady = false;
     console.error('Firebase initialization error:', err);
-    showLoginError(`ไม่สามารถเริ่มระบบเข้าสู่ระบบได้: ${err.message || err.code || 'Unknown error'}`);
 
+    showLoginError(
+      `ไม่สามารถเริ่มระบบเข้าสู่ระบบได้: ${err.message || err.code || 'Unknown error'}`
+    );
   }
-
 }
 
 // ฟังก์ชันใน ES module จะไม่ถูกเพิ่มลง window อัตโนมัติ
